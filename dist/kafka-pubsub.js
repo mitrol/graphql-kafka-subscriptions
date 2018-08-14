@@ -12,14 +12,24 @@ var defaultLogger = Logger.createLogger({
 var KafkaPubSub = (function () {
     function KafkaPubSub(options) {
         var _this = this;
-        this.createConsumer = function (client, topics) {
+        this.createConsumer = function (host, topics) {
             var groupId = _this.options.groupId || Math.ceil(Math.random() * 9999);
-            var consumer = new kafka.Consumer(client, topics.map(function (topic) { return ({ topic: topic }); }), { groupId: groupId });
+            var options = {
+                kafkaHost: host,
+                groupId: String(groupId),
+                fromOffset: 'latest',
+                commitOffsetsOnFirstJoin: true,
+                outOfRangeOffset: 'earliest'
+            };
+            var consumer = new kafka.ConsumerGroup(options, topics);
             consumer.on('message', function (message) {
                 var parsedMessage = JSON.parse(message.value.toString());
                 _this.onMessage(message.topic, parsedMessage);
             });
             consumer.on('error', function (err) {
+                _this.logger.error(err, 'Error in our kafka stream');
+            });
+            consumer.on('offsetOutOfRange', function (err) {
                 _this.logger.error(err, 'Error in our kafka stream');
             });
         };
@@ -29,7 +39,7 @@ var KafkaPubSub = (function () {
         this.subscriptionsByTopic = {};
         this.logger = child_logger_1.createChildLogger(this.options.logger || defaultLogger, 'KafkaPubSub');
         this.subscriptionIndex = 0;
-        this.createConsumer(this.client, this.options.topics);
+        this.createConsumer(options.host, this.options.topics);
         this.producer = this.createProducer(this.client);
     }
     KafkaPubSub.prototype.asyncIterator = function (triggers) {
@@ -54,7 +64,7 @@ var KafkaPubSub = (function () {
             topic: topic,
             messages: JSON.stringify(message)
         };
-        this.producer.send(request, function (err) {
+        this.producer.send([request], function (err) {
             if (err) {
                 _this.logger.error(err, 'Error while publishing message');
             }

@@ -42,7 +42,7 @@ export class KafkaPubSub implements PubSubEngine {
     );
     this.subscriptionIndex = 0;
 
-    this.createConsumer(this.client, this.options.topics);
+    this.createConsumer(options.host, this.options.topics);
     this.producer = this.createProducer(this.client);
   }
 
@@ -80,7 +80,7 @@ export class KafkaPubSub implements PubSubEngine {
       messages: JSON.stringify(message)
     };
 
-    this.producer.send(request, (err /*data*/) => {
+    this.producer.send([request], (err /*data*/) => {
       if (err) {
         this.logger.error(err, 'Error while publishing message');
       }
@@ -109,14 +109,21 @@ export class KafkaPubSub implements PubSubEngine {
     return producer;
   }
 
-  private createConsumer = (client, topics: [string]) => {
+  private createConsumer = (host, topics: [string]) => {
     const groupId = this.options.groupId || Math.ceil(Math.random() * 9999);
 
-    const consumer = new kafka.Consumer(
-      client,
-      topics.map(topic => ({ topic })),
-      { groupId }
-    );
+    var options = {
+      kafkaHost: host, // connect directly to kafka broker (instantiates a KafkaClient)
+      groupId: String(groupId),
+      // Offsets to use for new groups other options could be 'earliest' or 'none' (none will emit an error if no offsets were saved)
+      // equivalent to Java client's auto.offset.reset
+      fromOffset: 'latest', // default
+      commitOffsetsOnFirstJoin: true, // on the very first time this consumer group subscribes to a topic, record the offset returned in fromOffset (latest/earliest)
+      // how to recover from OutOfRangeOffset error (where save offset is past server retention) accepts same value as fromOffset
+      outOfRangeOffset: 'earliest' // default
+    };
+
+    var consumer = new kafka.ConsumerGroup(options, topics);
 
     consumer.on('message', message => {
       let parsedMessage = JSON.parse(message.value.toString());
@@ -124,6 +131,10 @@ export class KafkaPubSub implements PubSubEngine {
     });
 
     consumer.on('error', err => {
+      this.logger.error(err, 'Error in our kafka stream');
+    });
+
+    consumer.on('offsetOutOfRange', err => {
       this.logger.error(err, 'Error in our kafka stream');
     });
   };
