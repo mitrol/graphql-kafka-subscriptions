@@ -1,4 +1,4 @@
-import * as Kafka from 'node-rdkafka';
+import * as kafka from 'kafka-node';
 import { PubSubEngine } from 'graphql-subscriptions';
 import * as Logger from 'bunyan';
 import { createChildLogger } from './child-logger';
@@ -11,15 +11,6 @@ export interface IKafkaOptions {
   groupId?: any;
 }
 
-export interface IKafkaProducer {
-  write: (input: Buffer) => any;
-}
-
-export interface IKafkaTopic {
-  readStream: any;
-  writeStream: any;
-}
-
 const defaultLogger = Logger.createLogger({
   name: 'pubsub',
   stream: process.stdout,
@@ -27,7 +18,8 @@ const defaultLogger = Logger.createLogger({
 });
 
 export class KafkaPubSub implements PubSubEngine {
-  private producers: { [key: string]: any };
+  private client: any;
+  private producer: any;
   private subscriptionIndex: number;
   private options: any;
   private subscriptionMap: {
@@ -40,17 +32,18 @@ export class KafkaPubSub implements PubSubEngine {
   private logger: Logger;
 
   constructor(options: IKafkaOptions) {
+    this.client = new kafka.KafkaClient({ kafkaHost: options.host });
     this.options = options;
     this.subscriptionMap = {};
     this.subscriptionsByTopic = {};
-    this.producers = {};
     this.logger = createChildLogger(
       this.options.logger || defaultLogger,
       'KafkaPubSub'
     );
     this.subscriptionIndex = 0;
 
-    this.createConsumer(this.options.topics);
+    this.createConsumer(options.host, this.options.topics);
+    this.producer = this.createProducer(this.client);
   }
 
   public asyncIterator<T>(triggers: string | string[]): AsyncIterator<T> {
@@ -82,8 +75,18 @@ export class KafkaPubSub implements PubSubEngine {
   }
 
   public publish(topic: string, message: any) {
-    const producer = this.producers[topic] || this.createProducer(topic);
-    return producer.write(new Buffer(JSON.stringify(message)));
+    const request = {
+      topic,
+      messages: JSON.stringify(message)
+    };
+
+    this.producer.send([request], (err /*data*/) => {
+      if (err) {
+        this.logger.error(err, 'Error while publishing message');
+      }
+    });
+
+    return true;
   }
 
   private onMessage(topic: string, message) {
@@ -98,47 +101,40 @@ export class KafkaPubSub implements PubSubEngine {
     }
   }
 
-  private createProducer(topic: string) {
-    const kafkaProducer: {
-      createWriteStream: (conf: any, topicConf: any, streamOptions: any) => any;
-    } = Kafka.Producer as any;
-
-    const producer = kafkaProducer.createWriteStream(
-      {
-        'metadata.broker.list': this.options.host
-      },
-      {},
-      { topic }
-    );
+  private createProducer(client) {
+    const producer = new kafka.Producer(client);
     producer.on('error', err => {
       this.logger.error(err, 'Error in our kafka stream');
     });
-    this.producers[topic] = producer;
     return producer;
   }
 
-  private createConsumer = (topics: [string]) => {
-    const kafkaConsumer: {
-      createReadStream: (conf: any, topicConf: any, streamOptions: any) => any;
-    } = Kafka.KafkaConsumer as any;
-
+  private createConsumer = (host, topics: [string]) => {
     const groupId = this.options.groupId || Math.ceil(Math.random() * 9999);
-    const consumer = kafkaConsumer.createReadStream(
-      {
-        'group.id': `kafka-group-${groupId}`,
-        'metadata.broker.list': this.options.host
-      },
-      {},
-      {
-        topics
-      }
-    );
-    consumer.on('data', message => {
-      console.log(message);
+
+    var options = {
+      kafkaHost: host, // connect directly to kafka broker (instantiates a KafkaClient)
+      groupId: String(groupId),
+      // Offsets to use for new groups other options could be 'earliest' or 'none' (none will emit an error if no offsets were saved)
+      // equivalent to Java client's auto.offset.reset
+      fromOffset: 'latest', // default
+      commitOffsetsOnFirstJoin: true, // on the very first time this consumer group subscribes to a topic, record the offset returned in fromOffset (latest/earliest)
+      // how to recover from OutOfRangeOffset error (where save offset is past server retention) accepts same value as fromOffset
+      outOfRangeOffset: 'earliest' // default
+    };
+
+    var consumer = new kafka.ConsumerGroup(options, topics);
+
+    consumer.on('message', message => {
       let parsedMessage = JSON.parse(message.value.toString());
       this.onMessage(message.topic, parsedMessage);
     });
+
     consumer.on('error', err => {
+      this.logger.error(err, 'Error in our kafka stream');
+    });
+
+    consumer.on('offsetOutOfRange', err => {
       this.logger.error(err, 'Error in our kafka stream');
     });
   };

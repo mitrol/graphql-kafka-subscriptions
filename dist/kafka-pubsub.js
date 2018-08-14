@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-var Kafka = require("node-rdkafka");
+var kafka = require("kafka-node");
 var Logger = require("bunyan");
 var child_logger_1 = require("./child-logger");
 var pubsub_async_iterator_1 = require("./pubsub-async-iterator");
@@ -12,30 +12,35 @@ var defaultLogger = Logger.createLogger({
 var KafkaPubSub = (function () {
     function KafkaPubSub(options) {
         var _this = this;
-        this.createConsumer = function (topics) {
-            var kafkaConsumer = Kafka.KafkaConsumer;
+        this.createConsumer = function (host, topics) {
             var groupId = _this.options.groupId || Math.ceil(Math.random() * 9999);
-            var consumer = kafkaConsumer.createReadStream({
-                'group.id': "kafka-group-" + groupId,
-                'metadata.broker.list': _this.options.host
-            }, {}, {
-                topics: topics
-            });
-            consumer.on('data', function (message) {
+            var options = {
+                kafkaHost: host,
+                groupId: String(groupId),
+                fromOffset: 'latest',
+                commitOffsetsOnFirstJoin: true,
+                outOfRangeOffset: 'earliest'
+            };
+            var consumer = new kafka.ConsumerGroup(options, topics);
+            consumer.on('message', function (message) {
                 var parsedMessage = JSON.parse(message.value.toString());
                 _this.onMessage(message.topic, parsedMessage);
             });
             consumer.on('error', function (err) {
                 _this.logger.error(err, 'Error in our kafka stream');
             });
+            consumer.on('offsetOutOfRange', function (err) {
+                _this.logger.error(err, 'Error in our kafka stream');
+            });
         };
+        this.client = new kafka.KafkaClient({ kafkaHost: options.host });
         this.options = options;
         this.subscriptionMap = {};
         this.subscriptionsByTopic = {};
-        this.producers = {};
         this.logger = child_logger_1.createChildLogger(this.options.logger || defaultLogger, 'KafkaPubSub');
         this.subscriptionIndex = 0;
-        this.createConsumer(this.options.topics);
+        this.createConsumer(options.host, this.options.topics);
+        this.producer = this.createProducer(this.client);
     }
     KafkaPubSub.prototype.asyncIterator = function (triggers) {
         return new pubsub_async_iterator_1.PubSubAsyncIterator(this, triggers);
@@ -54,8 +59,17 @@ var KafkaPubSub = (function () {
         this.subscriptionsByTopic[topic] = this.subscriptionsByTopic[topic].filter(function (current) { return current !== index; });
     };
     KafkaPubSub.prototype.publish = function (topic, message) {
-        var producer = this.producers[topic] || this.createProducer(topic);
-        return producer.write(new Buffer(JSON.stringify(message)));
+        var _this = this;
+        var request = {
+            topic: topic,
+            messages: JSON.stringify(message)
+        };
+        this.producer.send([request], function (err) {
+            if (err) {
+                _this.logger.error(err, 'Error while publishing message');
+            }
+        });
+        return true;
     };
     KafkaPubSub.prototype.onMessage = function (topic, message) {
         var subscriptions = this.subscriptionsByTopic[topic];
@@ -68,16 +82,12 @@ var KafkaPubSub = (function () {
             onMessageCb(message);
         }
     };
-    KafkaPubSub.prototype.createProducer = function (topic) {
+    KafkaPubSub.prototype.createProducer = function (client) {
         var _this = this;
-        var kafkaProducer = Kafka.Producer;
-        var producer = kafkaProducer.createWriteStream({
-            'metadata.broker.list': this.options.host
-        }, {}, { topic: topic });
+        var producer = new kafka.Producer(client);
         producer.on('error', function (err) {
             _this.logger.error(err, 'Error in our kafka stream');
         });
-        this.producers[topic] = producer;
         return producer;
     };
     return KafkaPubSub;
